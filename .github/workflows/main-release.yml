@@ -1,0 +1,183 @@
+name: Main binaries
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Keep every push's build; reruns publish a separate snapshot of the same commit.
+concurrency:
+  group: main-release-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - runner: windows-2022
+            goos: windows
+            goarch: amd64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+      - name: Build GUI and headless Web binaries
+        env:
+          TARGET_GOOS: ${{ matrix.goos }}
+          TARGET_GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          test "$(go env GOOS)" = "$TARGET_GOOS"
+          test "$(go env GOARCH)" = "$TARGET_GOARCH"
+          VERSION="main-${GITHUB_SHA:0:12}"
+          BUILD_VERSION="0.0.$GITHUB_RUN_NUMBER"
+          mkdir -p dist/gui dist/web dist/assets
+          cp LICENSE dist/gui/
+          cp LICENSE dist/web/
+          EXT=""
+          case "$TARGET_GOOS" in
+            darwin)
+              CGO_ENABLED=1 make app VERSION="$VERSION"
+              # App metadata needs numeric versions; the binary keeps the commit.
+              /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $BUILD_VERSION" magpie.app/Contents/Info.plist
+              /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VERSION" magpie.app/Contents/Info.plist
+              codesign --force --deep --sign - magpie.app
+              codesign --verify --deep --strict magpie.app
+              cp -R magpie.app dist/gui/
+              ;;
+            linux)
+              CGO_ENABLED=1 make build VERSION="$VERSION"
+              cp magpie dist/gui/
+              ;;
+            windows)
+              EXT=".exe"
+              trap 'rm -f rsrc_windows_amd64.syso' EXIT
+              go run github.com/tc-hib/go-winres@v0.3.3 make \
+                --in build/windows/winres.json --arch amd64 --out rsrc \
+                --file-version "$BUILD_VERSION" --product-version "$BUILD_VERSION"
+              CGO_ENABLED=0 go build -tags production -trimpath \
+                -ldflags="-s -w -H windowsgui -X main.version=$VERSION" \
+                -o dist/gui/magpie.exe .
+              # The headless build keeps its console and excludes desktop resources.
+              rm -f rsrc_windows_amd64.syso
+              ;;
+          esac
+          CGO_ENABLED=0 go build -tags nogui -trimpath \
+            -ldflags="-s -w -X main.version=$VERSION" \
+            -o "dist/web/magpie$EXT" .
+          "./dist/web/magpie$EXT" --version
+      - name: Check Web management and gateway endpoints
+        if: runner.os == 'Linux'
+        env:
+          MAGPIE_ADDR: 127.0.0.1:13425
+          MAGPIE_WEB_KEY: ci-main-release-key
+        run: |
+          set -euo pipefail
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/magpie-smoke-config"
+          ./dist/web/magpie web --addr 127.0.0.1:13430 --no-open > "$RUNNER_TEMP/magpie-web.log" 2>&1 &
+          WEB_PID=$!
+          trap 'kill "$WEB_PID" 2>/dev/null || true; wait "$WEB_PID" 2>/dev/null || true' EXIT
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 --max-time 5 \
+            http://127.0.0.1:13425/v1/models > "$RUNNER_TEMP/models.json"
+          python3 -c 'import json, sys; assert json.load(open(sys.argv[1]))["object"] == "list"' "$RUNNER_TEMP/models.json"
+          test "$(curl --silent --show-error --max-time 5 --output /dev/null --write-out '%{http_code}' \
+            http://127.0.0.1:13430/api/usage)" = 401
+          curl --fail --silent --show-error --max-time 5 --cookie-jar "$RUNNER_TEMP/magpie-cookies" \
+            "http://127.0.0.1:13430/?k=$MAGPIE_WEB_KEY" --output /dev/null
+          curl --fail --silent --show-error --max-time 5 --cookie "$RUNNER_TEMP/magpie-cookies" \
+            'http://127.0.0.1:13430/api/usage?period=all' > "$RUNNER_TEMP/usage.json"
+          python3 -c 'import json, sys; assert "calls" in json.load(open(sys.argv[1]))' "$RUNNER_TEMP/usage.json"
+      - name: Package macOS and Linux binaries
+        if: runner.os != 'Windows'
+        env:
+          PLATFORM: ${{ matrix.goos }}-${{ matrix.goarch }}
+        run: |
+          tar -czf "dist/assets/magpie-gui-$PLATFORM.tar.gz" -C dist/gui .
+          tar -czf "dist/assets/magpie-web-$PLATFORM.tar.gz" -C dist/web .
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/gui/* -DestinationPath dist/assets/magpie-gui-windows-amd64.zip
+          Compress-Archive -Path dist/web/* -DestinationPath dist/assets/magpie-web-windows-amd64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish snapshot Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: assets
+          merge-multiple: true
+      - name: Verify assets and create checksums
+        working-directory: assets
+        run: |
+          set -euo pipefail
+          for kind in gui web; do
+            test -s "magpie-$kind-darwin-arm64.tar.gz"
+            test -s "magpie-$kind-linux-amd64.tar.gz"
+            test -s "magpie-$kind-windows-amd64.zip"
+          done
+          sha256sum magpie-* > SHA256SUMS.txt
+      - name: Publish to this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TAG="main-$GITHUB_RUN_NUMBER-$GITHUB_RUN_ATTEMPT-${GITHUB_SHA:0:12}"
+          printf 'Commit: %s\n\nBuild: %s\n\n' "$GITHUB_SHA" "$RUN_URL" > release-notes.md
+          cat >> release-notes.md <<'EOF'
+          Six builds from main: GUI and headless Web for macOS ARM64, Linux AMD64 and Windows AMD64.
+
+          - macOS GUI: extract the archive and open magpie.app. It is ad-hoc signed, without Apple notarization.
+          - Linux GUI: extract the archive and run ./magpie. GTK 3 and WebKitGTK 4.1 runtime libraries are required.
+          - Windows GUI: extract the ZIP and run magpie.exe. The WebView2 runtime is required.
+          - Headless Web: extract the archive and run ./magpie web --no-open (Windows: .\magpie.exe web --no-open). Use the printed link to authenticate to the management UI/API. Use serve to run only the model gateway.
+
+          These main snapshots carry a commit-based version and do not automatically replace themselves with upstream releases. SHA256SUMS.txt covers all six archives.
+          EOF
+          # Publish only after every platform succeeded and all assets were uploaded.
+          gh release create "$TAG" --target "$GITHUB_SHA" --draft --prerelease --latest=false \
+            --title "Main build ${GITHUB_SHA:0:12} (run $GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT)" \
+            --notes-file release-notes.md
+          gh release upload "$TAG" assets/*
+          gh release edit "$TAG" --draft=false

@@ -345,6 +345,28 @@ Linux needs `libgtk-3-dev` and `libwebkit2gtk-4.1-dev` for the app build
 (the Makefile adds the `gtk3` tag; with plain `go build`, pass `-tags gtk3`);
 Windows uses the WebView2 runtime that ships with the OS.
 
+### Fork builds from main
+
+The **Main binaries** workflow builds every push to `main` and publishes a
+prerelease in the current repository. It can also be run manually on `main`.
+All three platform builds must succeed before the release is published;
+only the built-in `GITHUB_TOKEN` is needed.
+This fork keeps only its own build workflow; daily upstream merges exclude
+upstream workflow and local action definitions.
+
+| Platform | Desktop GUI | Headless Web / CLI |
+| -------- | ----------- | ------------------ |
+| macOS ARM64 | `magpie-gui-darwin-arm64.tar.gz` (`magpie.app`) | `magpie-web-darwin-arm64.tar.gz` |
+| Linux AMD64 | `magpie-gui-linux-amd64.tar.gz` | `magpie-web-linux-amd64.tar.gz` |
+| Windows AMD64 | `magpie-gui-windows-amd64.zip` | `magpie-web-windows-amd64.zip` |
+
+Extract the Web archive and run `./magpie web --no-open` (Windows:
+`.\magpie.exe web --no-open`) for the management page/API and model gateway.
+`serve` starts only the model gateway. Each release includes `SHA256SUMS.txt`.
+The macOS app is ad-hoc signed, without notarization; Windows builds are
+unsigned. These commit-version snapshots do not automatically install
+upstream releases over the fork's binary.
+
 ### Docker
 
 `docker build` makes a server image: the terminal-only binary on
